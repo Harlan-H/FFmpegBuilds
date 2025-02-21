@@ -1,0 +1,169 @@
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "**.md"
+  schedule:
+     - cron: "0 0 5 * *"
+  workflow_dispatch:
+    inputs:
+      version_string:
+        type: string
+        description: 版本号
+        required: false
+      skip-version-check:
+        type: boolean
+        description: 跳过版本验证
+        required: false
+
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: master
+
+      - name: Get FFmpeg Version
+        id: ffmpeg-version
+        run: echo "version=$(cat ports/ffmpeg/vcpkg.json | jq -r '.version')" >> $GITHUB_OUTPUT
+
+      - name: Get latest Release Version
+        id: release-version
+        env: 
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "version=$(gh release view --json tagName --jq .tabName --repo ${{ github.event.repository.full_name }})" >> $GITHUB_OUTPUT
+
+    outputs:
+      version: ${{ inputs.version_string ||  steps.ffmpeg-version.outputs.version}}
+      updatable: ${{ inputs.skip-version-check || steps.ffmpeg-version.outputs.version != steps.release-version.outputs.version}}      
+
+
+  build:
+    needs: version
+    if: ${{ needs.version.outputs.updatable }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target-platform: [linux,windows,osx]
+        target-arch: [x64,x86,arm64]
+        include:
+          - target-platform: windows
+            os: windows-latest
+          - target-platform: linux
+            os: ubuntu-22.04
+          - target-platform: osx
+            os: macos-latest
+        
+        exclude:
+          - target-platform: osx
+            target-arch: x86
+          - target-platform: linux
+            target-arch: x86
+          - target-platform: linux
+            target-arch: arm64
+
+    runs-on: ${{matrix.os}}
+
+    steps:
+      - name: checkout vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: master
+
+      - name: Bootstrap vcpkg
+        shell: bash
+        run:  |
+              if [ "$RUNNER_OS" == "Windows" ]; then
+                  ./bootstrap-vcpkg.bat
+              else
+                  ./bootstrap-vcpkg.sh
+              fi
+
+      - name: Configuration
+        id: config
+        shell: bash
+        run: |
+          triplet_preferences=(
+            "${{matrix.target-arch}}-${{matrix.target-platform}}-static-release"
+            "${{matrix.target-arch}}-${{matrix.target-platform}}-static"
+            "${{matrix.target-arch}}-${{matrix.target-platform}}-release"
+            "${{matrix.target-arch}}-${{matrix.target-platform}}"
+          )
+
+          triplet=$(
+            for triplet in "${triplet_preferences[@]}"; do
+              if [ -f "triplets/$triplet.cmake" ] || [ -f "triplets/community/$triplet.cmake" ]; then
+                echo "$triplet"
+                break
+              fi
+            done
+          )
+          
+          echo "triplet=$triplet" >> $GITHUB_OUTPUT
+
+      - name:  Install dependencies
+        shell: bash
+        run:  |
+              if [ "$RUNNER_OS" == "Linux" ]; then  
+                  sudo apt install pkg-config
+                  sudo apt install nasm
+              elif [ "$RUNNER_OS" == "macOS" ]; then
+                  brew install nasm
+              fi
+
+      - name: Build FFmpeg
+        run:  ./vcpkg install ffmpeg[core,ffmpeg,ffplay,ffprobe,x264,x265]:${{steps.config.outputs.triplet}} --recurse
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{matrix.target-platform}}-${{matrix.target-arch}}
+          path: installed/${{steps.config.outputs.triplet}}/tools/ffmpeg/
+          if-no-files-found: error
+
+  deploy:
+    needs: 
+      - version
+      - build
+
+    permissions:
+      contents: write
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name:  Download ALL artifacts
+        uses:  actions/download-artifact@v4
+
+      - name: Create Package
+        run: |
+          if [ ! -n "$(ls)" ]; then
+              echo "当前目录没有任何文件"
+              exit 1;
+          fi
+
+          for dir in *; do
+              if [ -d "$dir" ]; then
+                  cd $dir 
+                  zip -r ../$dir.zip .
+                  echo "$dir.zip create success"
+                  cd ../
+              fi
+          done
+
+      - name: create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN}}
+        run: |
+          gh release create ${{ needs.version.outputs.version}}  ./ffmpeg-*.zip  \
+            --title ${{ needs.version.outputs.version}}  \
+            --notes "编译时间是:$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')" \
+            --repo ${{ github.event.repository.full_name}}
