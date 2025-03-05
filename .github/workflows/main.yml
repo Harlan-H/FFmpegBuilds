@@ -37,7 +37,7 @@ jobs:
         id: release-version
         env: 
             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "version=$(gh release view --json tagName --jq .tabName --repo ${{ github.event.repository.full_name }})" >> $GITHUB_OUTPUT
+        run: echo "version=$(gh release view --json tagName --jq .tagName --repo ${{ github.event.repository.full_name }})" >> $GITHUB_OUTPUT
 
     outputs:
       version: ${{ inputs.version_string ||  steps.ffmpeg-version.outputs.version}}
@@ -46,7 +46,7 @@ jobs:
 
   build:
     needs: version
-    if: ${{ needs.version.outputs.updatable }}
+    if: ${{ fromJson(needs.version.outputs.updatable) }}
 
     strategy:
       fail-fast: false
